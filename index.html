@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <meta
+      name="description"
+      content="Ultra-lightweight spatial camera air-drawing web application powered by MediaPipe Tasks Vision and HTML5 Canvas"
+    />
+    <title>AirDraw — Spatial Camera Air-Drawing Studio</title>
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='42' fill='%23050811' stroke='%2300F0FF' stroke-width='8'/><circle cx='50' cy='50' r='16' fill='%2300F0FF'/></svg>"
+    />
+  </head>
+  <body>
+    <main class="stage-container" id="stage-container">
+      <!-- Mirrored Webcam Video Background -->
+      <video
+        id="camera-video"
+        class="camera-video"
+        playsinline
+        muted
+        autoplay
+      ></video>
+
+      <!-- Persistent High-DPI Drawing Canvas -->
+      <canvas id="drawing-canvas" class="drawing-canvas"></canvas>
+
+      <!-- Dynamic 60FPS HUD & Adaptive Reticle Overlay Canvas -->
+      <canvas id="hud-canvas" class="hud-canvas"></canvas>
+
+      <!-- Floating Glassmorphic Spatial Controls -->
+      <div id="ui-layer" class="ui-layer"></div>
+    </main>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
