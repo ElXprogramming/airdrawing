@@ -8,6 +8,7 @@ import {
   INK_PALETTE,
   type AppState,
   type CameraBgMode,
+  type GestureMode,
   type NormalizedLandmark,
   type Point2D,
 } from '../types';
@@ -48,6 +49,9 @@ export class AppController {
 
   private latestLandmarks: NormalizedLandmark[] | null = null;
   private simulatedLandmarks: NormalizedLandmark[] | null = null;
+  private baseGestureMode: GestureMode = 'LOOKING';
+  private isPinching = false;
+  private pinchProximity = 0;
 
   private pointerFallbackActive = false;
   private pointerDown = false;
@@ -69,9 +73,8 @@ export class AppController {
     this.cameraManager = new CameraManager(videoEl);
     this.handTracker = new HandTracker();
     this.gestureClassifier = new GestureClassifier({
-      clearHoldDurationMs: 1500,
-      clearCooldownDurationMs: 2000,
-      clearDropoutGraceMs: 120,
+      pinchEnterThreshold: 0.34,
+      pinchExitThreshold: 0.43,
       confirmFramesRequired: 2,
     });
 
@@ -134,10 +137,7 @@ export class AppController {
   }
 
   public async start(): Promise<void> {
-    // Start 60fps decoupled render loop immediately so UI & canvas are responsive right away
     this.rafId = requestAnimationFrame((ts) => this.tick(ts));
-
-    // Initialize MediaPipe HandLandmarker & Webcam concurrently
     await Promise.all([this.initializeVision(), this.initializeCamera()]);
   }
 
@@ -161,7 +161,9 @@ export class AppController {
       this.toolbarUI.sync(this.state);
     } catch (err) {
       const msg =
-        err instanceof Error ? err.message : 'Webcam permission or hardware unavailable';
+        err instanceof Error
+          ? err.message
+          : 'Webcam permission or hardware unavailable';
       this.state.cameraReady = false;
       this.state.cameraError = msg;
       this.toolbarUI.sync(this.state);
@@ -188,8 +190,9 @@ export class AppController {
       this.hudRenderer.resize(w, h, dpr);
     });
 
-    // Pointer fallback when no hand is tracked (allows mouse/stylus/touch studio drawing)
-    interactiveCanvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    interactiveCanvas.addEventListener('contextmenu', (e) =>
+      e.preventDefault()
+    );
 
     interactiveCanvas.addEventListener('pointerdown', (e) => {
       if (this.latestLandmarks !== null || this.simulatedLandmarks !== null) {
@@ -237,7 +240,8 @@ export class AppController {
   /**
    * Main 60+ FPS decoupled loop:
    * - Vision inference runs ONLY when a new video frame is decoded
-   * - Smoothing, Bézier stroke emission, and HUD rendering run at full display refresh rate
+   * - Spatial Air-Click dock hit-testing, 1.0s Trash pinch-hold, Bézier stroke emission,
+   *   and HUD rendering run at full display refresh rate
    */
   private tick(nowMs: number): void {
     // 1. Update rolling FPS counter
@@ -263,38 +267,63 @@ export class AppController {
     ) {
       this.latestLandmarks = this.handTracker.detect(this.videoEl, nowMs);
       this.processVisionMeasurement(this.latestLandmarks, nowMs);
-    } else if (this.latestLandmarks !== null) {
-      // Advance gesture hold timers (such as 1.5s Open Palm clear) smoothly between 30fps video frames
-      this.processVisionMeasurement(this.latestLandmarks, nowMs, false);
     }
 
-    // 3. Render Step: Advance 60fps interpolated cursor & emit strokes
+    // 3. Render Step: Advance 60fps interpolated cursor, evaluate Spatial Dock UI, & emit strokes
     let renderCursor: Point2D | null = null;
     let renderPalm: Point2D | null = null;
+    let isHoveringUI = false;
 
     if (this.latestLandmarks !== null) {
       renderCursor = this.cursorSmoother.stepRenderFrame(0.6);
       renderPalm = this.palmSmoother.stepRenderFrame(0.55);
 
-      if (this.state.gestureMode === 'DRAWING' && renderCursor) {
-        this.drawingEngine.addStrokePoint(
-          renderCursor,
-          'draw',
-          this.state.activeColor,
-          this.state.brushSize
-        );
-      } else if (this.state.gestureMode === 'ERASER' && renderCursor) {
-        this.drawingEngine.addStrokePoint(
-          renderCursor,
-          'erase',
-          '#000000',
-          ERASER_DIAMETER_PX
-        );
-      } else {
+      const spatialUI = this.toolbarUI.evaluateSpatialCursor(
+        renderCursor,
+        this.isPinching,
+        nowMs
+      );
+      isHoveringUI = spatialUI.isHoveringButton;
+
+      if (spatialUI.isHoldingTrash) {
+        this.state.gestureMode = 'CLEARING';
+        this.state.clearProgress = spatialUI.trashClearProgress;
         this.drawingEngine.endStroke();
+
+        if (spatialUI.shouldTriggerTrashClear) {
+          this.drawingEngine.clearCanvas();
+          this.hudRenderer.triggerClearFlash(renderCursor);
+        }
+      } else if (spatialUI.suppressCanvasDrawing) {
+        this.state.gestureMode = 'HOVERING';
+        this.state.clearProgress = 0;
+        this.drawingEngine.endStroke();
+      } else {
+        this.state.gestureMode = this.baseGestureMode;
+        this.state.clearProgress = 0;
+
+        if (this.state.gestureMode === 'DRAWING' && renderCursor) {
+          this.drawingEngine.addStrokePoint(
+            renderCursor,
+            'draw',
+            this.state.activeColor,
+            this.state.brushSize
+          );
+        } else if (this.state.gestureMode === 'ERASER' && renderCursor) {
+          this.drawingEngine.addStrokePoint(
+            renderCursor,
+            'erase',
+            '#000000',
+            ERASER_DIAMETER_PX
+          );
+        } else {
+          this.drawingEngine.endStroke();
+        }
       }
     } else if (this.pointerFallbackActive && this.pointerPosNormalized) {
       renderCursor = this.cursorSmoother.stepRenderFrame(0.75);
+      this.toolbarUI.evaluateSpatialCursor(null, false, nowMs);
+
       if (this.pointerDown && renderCursor) {
         if (this.pointerRightButton) {
           this.state.gestureMode = 'ERASER';
@@ -321,6 +350,7 @@ export class AppController {
         this.drawingEngine.endStroke();
       }
     } else {
+      this.toolbarUI.evaluateSpatialCursor(null, false, nowMs);
       this.drawingEngine.endStroke();
     }
 
@@ -335,6 +365,8 @@ export class AppController {
       brushSize: this.state.brushSize,
       eraserDiameter: ERASER_DIAMETER_PX,
       clearProgress: this.state.clearProgress,
+      pinchProximity: this.pinchProximity,
+      isHoveringUI,
       nowMs,
     });
 
@@ -346,16 +378,18 @@ export class AppController {
 
   private processVisionMeasurement(
     landmarks: NormalizedLandmark[] | null,
-    nowMs: number,
-    isNewCameraFrame = true
+    nowMs: number
   ): void {
     const evalResult = this.gestureClassifier.evaluate(landmarks, nowMs);
-    const prevMode = this.state.gestureMode;
+    const prevBaseMode = this.baseGestureMode;
 
-    this.state.gestureMode = evalResult.mode;
-    this.state.clearProgress = evalResult.clearProgress;
+    this.baseGestureMode = evalResult.mode;
+    this.isPinching = evalResult.isPinching;
+    this.pinchProximity = evalResult.pinchProximity;
 
     if (evalResult.mode === 'LOOKING') {
+      this.state.gestureMode = 'LOOKING';
+      this.state.clearProgress = 0;
       this.cursorSmoother.reset();
       this.palmSmoother.reset();
       this.firstGestureStartMs = null;
@@ -364,36 +398,27 @@ export class AppController {
 
     this.markFirstGesture(nowMs);
 
-    if (isNewCameraFrame) {
-      if (evalResult.cursorNormalized) {
-        // Seed filter cleanly when acquiring hand or starting a new DRAW/ERASE stroke
-        if (
-          prevMode === 'LOOKING' ||
-          (prevMode !== evalResult.mode &&
-            (evalResult.mode === 'DRAWING' || evalResult.mode === 'ERASER'))
-        ) {
-          this.cursorSmoother.reset();
-        }
-        this.cursorSmoother.updateFromMeasurement(
-          evalResult.cursorNormalized,
-          nowMs
-        );
+    if (evalResult.cursorNormalized) {
+      if (
+        prevBaseMode === 'LOOKING' ||
+        (prevBaseMode !== evalResult.mode && evalResult.mode === 'ERASER')
+      ) {
+        this.cursorSmoother.reset();
       }
-
-      if (evalResult.palmCenterNormalized) {
-        if (prevMode === 'LOOKING') {
-          this.palmSmoother.reset();
-        }
-        this.palmSmoother.updateFromMeasurement(
-          evalResult.palmCenterNormalized,
-          nowMs
-        );
-      }
+      this.cursorSmoother.updateFromMeasurement(
+        evalResult.cursorNormalized,
+        nowMs
+      );
     }
 
-    if (evalResult.shouldTriggerClear) {
-      this.drawingEngine.clearCanvas();
-      this.hudRenderer.triggerClearFlash(evalResult.palmCenterNormalized);
+    if (evalResult.palmCenterNormalized) {
+      if (prevBaseMode === 'LOOKING') {
+        this.palmSmoother.reset();
+      }
+      this.palmSmoother.updateFromMeasurement(
+        evalResult.palmCenterNormalized,
+        nowMs
+      );
     }
   }
 
@@ -416,8 +441,11 @@ export class AppController {
     if (landmarks === null) {
       this.latestLandmarks = null;
       this.gestureClassifier.reset();
+      this.baseGestureMode = 'LOOKING';
       this.state.gestureMode = 'LOOKING';
       this.state.clearProgress = 0;
+      this.isPinching = false;
+      this.pinchProximity = 0;
     }
   }
 

@@ -5,51 +5,32 @@ import type { NormalizedLandmark } from '../types';
 
 /**
  * Helper to synthesize realistic 21-point MediaPipe hand landmarks
- * for each posture in normalized [0..1] space.
+ * for Pinch-to-Draw, Open-Hand Hover, and Closed-Fist Eraser postures.
  */
 function createSyntheticHand(options: {
-  thumb: boolean;
-  index: boolean;
-  middle: boolean;
-  ring: boolean;
-  pinky: boolean;
+  posture: 'PINCH' | 'OPEN_HOVER' | 'CLOSED_FIST';
+  pinchGapRatio?: number;
   rotationRad?: number;
   scale?: number;
 }): NormalizedLandmark[] {
   const {
-    thumb,
-    index,
-    middle,
-    ring,
-    pinky,
+    posture,
+    pinchGapRatio = posture === 'PINCH' ? 0.12 : 0.75,
     rotationRad = 0,
     scale = 1.0,
   } = options;
 
-  // Base wrist at (0.5, 0.75)
   const cx = 0.5;
   const cy = 0.75;
+  const palmLen = 0.16;
 
   const rawPoints: Array<{ x: number; y: number; z: number }> = new Array(21)
     .fill(null)
-    .map(() => ({ x: cx, y: cy, z: 0 }));
+    .map(() => ({ x: 0, y: 0, z: 0 }));
 
-  // 0: Wrist
+  // 0: Wrist at origin, 9: Middle MCP at (0, -palmLen) -> palmScale = 0.16
   rawPoints[0] = { x: 0, y: 0, z: 0 };
 
-  // Thumb (1..4)
-  rawPoints[1] = { x: -0.05, y: -0.03, z: 0 };
-  rawPoints[2] = { x: -0.09, y: -0.08, z: 0 };
-  if (thumb) {
-    rawPoints[3] = { x: -0.14, y: -0.13, z: 0 };
-    rawPoints[4] = { x: -0.19, y: -0.18, z: 0 };
-  } else {
-    // Folded across palm toward index/middle MCP
-    rawPoints[3] = { x: -0.05, y: -0.12, z: 0 };
-    rawPoints[4] = { x: -0.01, y: -0.13, z: 0 };
-  }
-
-  // Helper to populate a 4-joint finger (MCP, PIP, DIP, TIP)
   const setFinger = (
     mcpIdx: number,
     baseX: number,
@@ -75,17 +56,51 @@ function createSyntheticHand(options: {
         z: 0,
       };
     } else {
-      // Curled back toward palm/MCP
-      rawPoints[mcpIdx + 1] = { x: baseX, y: baseY - 0.04, z: 0 };
+      rawPoints[mcpIdx + 1] = { x: baseX, y: baseY - 0.03, z: 0 };
       rawPoints[mcpIdx + 2] = { x: baseX, y: baseY - 0.01, z: 0 };
       rawPoints[mcpIdx + 3] = { x: baseX, y: baseY + 0.02, z: 0 };
     }
   };
 
-  setFinger(5, -0.06, -0.15, index, -0.03);
-  setFinger(9, -0.02, -0.16, middle, -0.005);
-  setFinger(13, 0.02, -0.15, ring, 0.02);
-  setFinger(17, 0.06, -0.13, pinky, 0.05);
+  if (posture === 'PINCH') {
+    // Index finger angled toward thumb tip; Middle, Ring, Pinky extended/relaxed
+    rawPoints[5] = { x: -0.05, y: -0.15, z: 0 };
+    rawPoints[6] = { x: -0.06, y: -0.21, z: 0 };
+    rawPoints[7] = { x: -0.06, y: -0.25, z: 0 };
+    rawPoints[8] = { x: -0.05, y: -0.27, z: 0 };
+
+    const gap = pinchGapRatio * palmLen;
+    rawPoints[1] = { x: -0.04, y: -0.04, z: 0 };
+    rawPoints[2] = { x: -0.07, y: -0.11, z: 0 };
+    rawPoints[3] = { x: -0.07, y: -0.19, z: 0 };
+    rawPoints[4] = { x: -0.05 - gap, y: -0.27, z: 0 };
+
+    setFinger(9, -0.01, -palmLen, true, 0);
+    setFinger(13, 0.03, -0.15, true, 0.02);
+    setFinger(17, 0.06, -0.13, true, 0.04);
+  } else if (posture === 'OPEN_HOVER') {
+    // Open hand with thumb and index separated
+    rawPoints[1] = { x: -0.05, y: -0.03, z: 0 };
+    rawPoints[2] = { x: -0.09, y: -0.08, z: 0 };
+    rawPoints[3] = { x: -0.14, y: -0.13, z: 0 };
+    rawPoints[4] = { x: -0.19, y: -0.18, z: 0 };
+
+    setFinger(5, -0.05, -0.15, true, -0.03);
+    setFinger(9, -0.01, -palmLen, true, 0);
+    setFinger(13, 0.03, -0.15, true, 0.02);
+    setFinger(17, 0.06, -0.13, true, 0.04);
+  } else {
+    // CLOSED_FIST: all 4 fingers curled tightly, thumb tucked along lower palm
+    rawPoints[1] = { x: -0.04, y: -0.03, z: 0 };
+    rawPoints[2] = { x: -0.06, y: -0.07, z: 0 };
+    rawPoints[3] = { x: -0.03, y: -0.09, z: 0 };
+    rawPoints[4] = { x: 0.02, y: -0.09, z: 0 };
+
+    setFinger(5, -0.05, -0.15, false);
+    setFinger(9, -0.01, -palmLen, false);
+    setFinger(13, 0.03, -0.15, false);
+    setFinger(17, 0.06, -0.13, false);
+  }
 
   const cosR = Math.cos(rotationRad);
   const sinR = Math.sin(rotationRad);
@@ -113,7 +128,6 @@ describe('OneEuroFilter1D & PointSmoother2D', () => {
       filtered.push(filter.filter(v, idx * 16.67));
     });
 
-    // Variance of filtered signal should be substantially smaller than raw jitter
     const rawRange = Math.max(...rawValues) - Math.min(...rawValues);
     const filteredTail = filtered.slice(2);
     const filteredRange =
@@ -137,137 +151,84 @@ describe('OneEuroFilter1D & PointSmoother2D', () => {
   });
 });
 
-describe('GestureClassifier — Point & Palm State Machine', () => {
-  it('classifies Draw Mode (Index extended, others curled) and mirrors X coordinate', () => {
+describe('GestureClassifier — Pinch-to-Draw State Machine', () => {
+  it('classifies Pinch (Thumb 4 + Index 8 < epsilon) as DRAWING and blends cursor to pinch midpoint', () => {
     const classifier = new GestureClassifier({ confirmFramesRequired: 2 });
-    const drawHand = createSyntheticHand({
-      thumb: false,
-      index: true,
-      middle: false,
-      ring: false,
-      pinky: false,
-    });
+    const pinchHand = createSyntheticHand({ posture: 'PINCH' });
 
-    // Frame 1 (pending confirmation)
-    classifier.evaluate(drawHand, 100);
-    // Frame 2 (confirmed)
-    const res = classifier.evaluate(drawHand, 133);
+    classifier.evaluate(pinchHand, 100);
+    const res = classifier.evaluate(pinchHand, 133);
 
     expect(res.mode).toBe('DRAWING');
-    expect(res.cursorNormalized).not.toBeNull();
-    expect(res.cursorNormalized!.x).toBeCloseTo(1.0 - drawHand[8].x, 5);
-    expect(res.cursorNormalized!.y).toBeCloseTo(drawHand[8].y, 5);
+    expect(res.isPinching).toBe(true);
+    expect(res.pinchProximity).toBe(1);
+
+    const expectedMidX = 1.0 - (pinchHand[8].x + pinchHand[4].x) * 0.5;
+    const expectedMidY = (pinchHand[8].y + pinchHand[4].y) * 0.5;
+    expect(res.cursorNormalized!.x).toBeCloseTo(expectedMidX, 4);
+    expect(res.cursorNormalized!.y).toBeCloseTo(expectedMidY, 4);
   });
 
-  it('classifies Hover Mode (Peace / V sign) and exits Draw Mode on the very first frame', () => {
-    const classifier = new GestureClassifier({ confirmFramesRequired: 2 });
-    const drawHand = createSyntheticHand({
-      thumb: false,
-      index: true,
-      middle: false,
-      ring: false,
-      pinky: false,
-    });
-    const peaceHand = createSyntheticHand({
-      thumb: false,
-      index: true,
-      middle: true,
-      ring: false,
-      pinky: false,
+  it('maintains Pinch via hysteresis and exits immediately to HOVERING when fingers open', () => {
+    const classifier = new GestureClassifier({
+      pinchEnterThreshold: 0.34,
+      pinchExitThreshold: 0.43,
+      confirmFramesRequired: 1,
     });
 
-    classifier.evaluate(drawHand, 100);
-    expect(classifier.evaluate(drawHand, 133).mode).toBe('DRAWING');
+    // Enter pinch at ratio 0.20 (< 0.34)
+    const tightPinch = createSyntheticHand({
+      posture: 'PINCH',
+      pinchGapRatio: 0.2,
+    });
+    expect(classifier.evaluate(tightPinch, 100).mode).toBe('DRAWING');
 
-    // Immediate 1-frame pen-up transition to HOVERING
-    const hoverRes = classifier.evaluate(peaceHand, 166);
+    // Slight separation to ratio 0.38 (between 0.34 and 0.43) stays latched in DRAWING
+    const hysteresisPinch = createSyntheticHand({
+      posture: 'PINCH',
+      pinchGapRatio: 0.38,
+    });
+    expect(classifier.evaluate(hysteresisPinch, 133).mode).toBe('DRAWING');
+
+    // Opening fingers transitions immediately on frame 1 to HOVERING
+    const openHand = createSyntheticHand({ posture: 'OPEN_HOVER' });
+    const hoverRes = classifier.evaluate(openHand, 166);
     expect(hoverRes.mode).toBe('HOVERING');
+    expect(hoverRes.isPinching).toBe(false);
   });
 
-  it('classifies Eraser Mode (Closed Fist)', () => {
+  it('classifies Closed Fist as ERASER and does not confuse it with Pinch', () => {
     const classifier = new GestureClassifier({ confirmFramesRequired: 2 });
-    const fistHand = createSyntheticHand({
-      thumb: false,
-      index: false,
-      middle: false,
-      ring: false,
-      pinky: false,
-    });
+    const fistHand = createSyntheticHand({ posture: 'CLOSED_FIST' });
 
     classifier.evaluate(fistHand, 100);
     const res = classifier.evaluate(fistHand, 133);
     expect(res.mode).toBe('ERASER');
+    expect(res.isPinching).toBe(false);
   });
 
   it('is invariant to hand tilt rotation and camera distance scaling', () => {
     const classifier = new GestureClassifier({ confirmFramesRequired: 1 });
 
-    // Tilted 65 degrees and scaled 0.6x (farther from camera)
-    const tiltedDraw = createSyntheticHand({
-      thumb: false,
-      index: true,
-      middle: false,
-      ring: false,
-      pinky: false,
-      rotationRad: (65 * Math.PI) / 180,
-      scale: 0.6,
+    const tiltedPinch = createSyntheticHand({
+      posture: 'PINCH',
+      rotationRad: (60 * Math.PI) / 180,
+      scale: 0.65,
     });
-    expect(classifier.evaluate(tiltedDraw, 200).mode).toBe('DRAWING');
+    expect(classifier.evaluate(tiltedPinch, 200).mode).toBe('DRAWING');
 
-    // Tilted -50 degrees and scaled 1.5x (closer to camera)
     const tiltedHover = createSyntheticHand({
-      thumb: false,
-      index: true,
-      middle: true,
-      ring: false,
-      pinky: false,
-      rotationRad: (-50 * Math.PI) / 180,
-      scale: 1.5,
+      posture: 'OPEN_HOVER',
+      rotationRad: (-45 * Math.PI) / 180,
+      scale: 1.4,
     });
     expect(classifier.evaluate(tiltedHover, 233).mode).toBe('HOVERING');
-  });
 
-  it('triggers Canvas Clear after 1.5s continuous Open Palm hold and enforces 2s cooldown', () => {
-    const classifier = new GestureClassifier({
-      clearHoldDurationMs: 1500,
-      clearCooldownDurationMs: 2000,
-      confirmFramesRequired: 2,
+    const tiltedFist = createSyntheticHand({
+      posture: 'CLOSED_FIST',
+      rotationRad: (35 * Math.PI) / 180,
+      scale: 0.8,
     });
-    const openPalm = createSyntheticHand({
-      thumb: true,
-      index: true,
-      middle: true,
-      ring: true,
-      pinky: true,
-    });
-
-    // Start at t = 1000ms
-    const r0 = classifier.evaluate(openPalm, 1000);
-    expect(r0.mode).toBe('CLEARING');
-    expect(r0.clearProgress).toBe(0);
-    expect(r0.shouldTriggerClear).toBe(false);
-
-    // Halfway at t = 1750ms (750ms elapsed -> 50%)
-    const rHalf = classifier.evaluate(openPalm, 1750);
-    expect(rHalf.mode).toBe('CLEARING');
-    expect(rHalf.clearProgress).toBeCloseTo(0.5, 2);
-    expect(rHalf.shouldTriggerClear).toBe(false);
-
-    // Complete at t = 2500ms (1500ms elapsed -> 100% trigger!)
-    const rDone = classifier.evaluate(openPalm, 2500);
-    expect(rDone.clearProgress).toBe(1.0);
-    expect(rDone.shouldTriggerClear).toBe(true);
-    expect(rDone.inClearCooldown).toBe(true);
-
-    // During 2-second cooldown (t = 3200ms), holding palm does not re-trigger clear
-    const rCooldown = classifier.evaluate(openPalm, 3200);
-    expect(rCooldown.shouldTriggerClear).toBe(false);
-    expect(rCooldown.inClearCooldown).toBe(true);
-    expect(rCooldown.mode).toBe('HOVERING');
-
-    // After 2-second cooldown expires (t = 4600ms), open palm can start a new clear cycle
-    const rPostCooldown = classifier.evaluate(openPalm, 4600);
-    expect(rPostCooldown.inClearCooldown).toBe(false);
-    expect(rPostCooldown.mode).toBe('CLEARING');
+    expect(classifier.evaluate(tiltedFist, 266).mode).toBe('ERASER');
   });
 });

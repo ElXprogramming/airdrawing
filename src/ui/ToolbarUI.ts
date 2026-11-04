@@ -5,6 +5,7 @@ import {
   type AppState,
   type CameraBgMode,
   type GestureMode,
+  type Point2D,
 } from '../types';
 import { ICONS } from './icons';
 
@@ -21,6 +22,23 @@ export interface ToolbarCallbacks {
   onRetryCamera: () => void;
 }
 
+export interface SpatialUIInteractionResult {
+  /** True when cursor is hovering over or interacting with the floating dock/UI */
+  suppressCanvasDrawing: boolean;
+  /** True when cursor is directly over an interactive dock button */
+  isHoveringButton: boolean;
+  /** True while actively pinch-holding the Trash button for 1.0s wipe */
+  isHoldingTrash: boolean;
+  /** Progress [0..1] of the 1.0s Trash pinch-hold */
+  trashClearProgress: number;
+  /** True on the exact frame when 1.0s Trash pinch-hold completes */
+  shouldTriggerTrashClear: boolean;
+}
+
+const TRASH_HOLD_DURATION_MS = 1000;
+const TRASH_COOLDOWN_MS = 1500;
+const HIT_PADDING_PX = 8;
+
 export class ToolbarUI {
   private readonly root: HTMLElement;
   private readonly callbacks: ToolbarCallbacks;
@@ -32,6 +50,7 @@ export class ToolbarUI {
   private fpsEl!: HTMLElement;
   private delegateEl!: HTMLElement;
 
+  private capsuleEl!: HTMLElement;
   private colorButtons: Map<string, HTMLButtonElement> = new Map();
   private customColorInput!: HTMLInputElement;
   private customColorChip!: HTMLElement;
@@ -43,6 +62,8 @@ export class ToolbarUI {
   private cameraBgBadgeEl!: HTMLElement;
   private cameraBgSegmentBtns: Map<CameraBgMode, HTMLButtonElement> = new Map();
   private skeletonBtn!: HTMLButtonElement;
+  private downloadBtn!: HTMLButtonElement;
+  private clearBtn!: HTMLButtonElement;
 
   private gestureGuideEl!: HTMLElement;
   private guideToggleBtn!: HTMLButtonElement;
@@ -51,6 +72,15 @@ export class ToolbarUI {
 
   private cameraBannerEl!: HTMLElement;
   private cameraBannerMsgEl!: HTMLElement;
+
+  private interactiveTargets: HTMLElement[] = [];
+  private currentHoveredTarget: HTMLElement | null = null;
+  private wasPinchingPrevFrame = false;
+  private pinchStartedInUI = false;
+  private pinchStartedOnCanvas = false;
+
+  private trashHoldStartMs: number | null = null;
+  private trashCooldownUntilMs = 0;
 
   private lastRenderedMode: GestureMode | null = null;
   private lastClearPct = -1;
@@ -123,21 +153,28 @@ export class ToolbarUI {
       <div class="gesture-guide-card" id="gesture-guide-card" aria-label="Gesture Controls Guide">
         <div class="gesture-guide-header">
           <span class="gesture-guide-title">GESTURE CONTROLS</span>
-          <span class="gesture-guide-badge">Point &amp; Palm</span>
+          <span class="gesture-guide-badge">Pinch to Draw</span>
         </div>
         <ul class="gesture-guide-list">
           <li class="gesture-guide-item" data-gesture="DRAWING">
-            <span class="gesture-emoji">☝️</span>
+            <span class="gesture-emoji">🤏</span>
             <div class="gesture-info">
-              <strong>Point (Index)</strong>
-              <span>Pen down &amp; draw</span>
+              <strong>Pinch (Thumb + Index)</strong>
+              <span>Pen down &amp; draw strokes</span>
             </div>
           </li>
           <li class="gesture-guide-item" data-gesture="HOVERING">
-            <span class="gesture-emoji">✌️</span>
+            <span class="gesture-emoji">✋</span>
             <div class="gesture-info">
-              <strong>Peace (Index + Middle)</strong>
+              <strong>Open Hand</strong>
               <span>Hover &amp; aim cursor</span>
+            </div>
+          </li>
+          <li class="gesture-guide-item" data-gesture="AIRCLICK">
+            <span class="gesture-emoji">🎯</span>
+            <div class="gesture-info">
+              <strong>Air-Click Dock</strong>
+              <span>Hover tool &amp; pinch to select</span>
             </div>
           </li>
           <li class="gesture-guide-item" data-gesture="ERASER">
@@ -148,10 +185,10 @@ export class ToolbarUI {
             </div>
           </li>
           <li class="gesture-guide-item" data-gesture="CLEARING">
-            <span class="gesture-emoji">🖐️</span>
+            <span class="gesture-emoji">🗑️</span>
             <div class="gesture-info">
-              <strong>Open Palm (Hold 1.5s)</strong>
-              <span>Radial canvas wipe</span>
+              <strong>Hold Trash (1.0s)</strong>
+              <span>Pinch &amp; hold 🗑️ to wipe canvas</span>
             </div>
           </li>
         </ul>
@@ -186,6 +223,7 @@ export class ToolbarUI {
 
     const capsule = document.createElement('div');
     capsule.className = 'tool-capsule';
+    this.capsuleEl = capsule;
 
     // 4A. Color Swatches + Custom Color Picker
     const swatchGroup = document.createElement('div');
@@ -197,7 +235,7 @@ export class ToolbarUI {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'color-swatch-btn';
-      btn.title = `${swatch.name} (${swatch.hex})`;
+      btn.title = `${swatch.name} (${swatch.hex}) — Air-Pinch to select`;
       btn.setAttribute('aria-label', swatch.name);
       btn.dataset.color = swatch.hex;
       btn.style.setProperty('--swatch-color', swatch.hex);
@@ -207,6 +245,7 @@ export class ToolbarUI {
       });
       swatchGroup.appendChild(btn);
       this.colorButtons.set(swatch.hex.toUpperCase(), btn);
+      this.interactiveTargets.push(btn);
     }
 
     // Custom Color Picker Chip
@@ -240,7 +279,7 @@ export class ToolbarUI {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'brush-preset-btn';
-      btn.title = preset.label;
+      btn.title = `${preset.label} — Air-Pinch to select`;
       btn.setAttribute('aria-label', preset.label);
       btn.dataset.size = String(preset.size);
 
@@ -253,6 +292,7 @@ export class ToolbarUI {
       });
       brushGroup.appendChild(btn);
       this.brushButtons.set(preset.size, btn);
+      this.interactiveTargets.push(btn);
     }
     capsule.appendChild(brushGroup);
 
@@ -278,6 +318,7 @@ export class ToolbarUI {
       this.callbacks.onCycleCameraBg();
     });
     bgGroup.appendChild(this.cameraBgBtn);
+    this.interactiveTargets.push(this.cameraBgBtn);
 
     const segContainer = document.createElement('div');
     segContainer.className = 'bg-segmented-pills';
@@ -299,6 +340,7 @@ export class ToolbarUI {
       });
       segContainer.appendChild(segBtn);
       this.cameraBgSegmentBtns.set(item.mode, segBtn);
+      this.interactiveTargets.push(segBtn);
     }
     bgGroup.appendChild(segContainer);
     capsule.appendChild(bgGroup);
@@ -311,31 +353,31 @@ export class ToolbarUI {
 
     this.undoBtn = this.createUtilityButton(
       ICONS.undo,
-      'Undo Stroke (Ctrl+Z)',
+      'Undo Stroke (Ctrl+Z or Air-Pinch)',
       'undo-btn',
       () => this.callbacks.onUndo()
     );
     this.redoBtn = this.createUtilityButton(
       ICONS.redo,
-      'Redo Stroke (Ctrl+Y)',
+      'Redo Stroke (Ctrl+Y or Air-Pinch)',
       'redo-btn',
       () => this.callbacks.onRedo()
     );
     this.skeletonBtn = this.createUtilityButton(
       ICONS.skeleton,
-      'Toggle Hand Skeleton Overlay (S)',
+      'Toggle Hand Skeleton Overlay (S or Air-Pinch)',
       'skeleton-btn',
       () => this.callbacks.onToggleSkeleton()
     );
-    const downloadBtn = this.createUtilityButton(
+    this.downloadBtn = this.createUtilityButton(
       ICONS.download,
-      'Download PNG Artwork',
+      'Download PNG Artwork (Air-Pinch)',
       'download-btn',
       () => this.callbacks.onExportPng()
     );
-    const clearBtn = this.createUtilityButton(
+    this.clearBtn = this.createUtilityButton(
       ICONS.trash,
-      'Clear Canvas (Delete)',
+      'Clear Canvas (Click or Air-Pinch & Hold 1.0s)',
       'clear-btn danger-hover',
       () => this.callbacks.onClear()
     );
@@ -344,10 +386,19 @@ export class ToolbarUI {
       this.undoBtn,
       this.redoBtn,
       this.skeletonBtn,
-      downloadBtn,
-      clearBtn
+      this.downloadBtn,
+      this.clearBtn
     );
     capsule.appendChild(utilityGroup);
+
+    this.interactiveTargets.push(
+      this.undoBtn,
+      this.redoBtn,
+      this.skeletonBtn,
+      this.downloadBtn,
+      this.clearBtn,
+      this.guideToggleBtn
+    );
 
     bottomDock.appendChild(capsule);
     this.root.appendChild(bottomDock);
@@ -373,6 +424,182 @@ export class ToolbarUI {
     btn.innerHTML = svgHtml;
     btn.addEventListener('click', onClick);
     return btn;
+  }
+
+  /**
+   * Evaluates spatial Air-Hover, Air-Click (Pinch on Dock Swatches/Buttons),
+   * and Air-Pinch & Hold (1.0s on Trash Button to wipe canvas).
+   */
+  public evaluateSpatialCursor(
+    cursorNormalized: Point2D | null,
+    isPinching: boolean,
+    nowMs: number
+  ): SpatialUIInteractionResult {
+    if (!cursorNormalized) {
+      this.setHoveredTarget(null);
+      this.wasPinchingPrevFrame = false;
+      this.pinchStartedInUI = false;
+      this.pinchStartedOnCanvas = false;
+      this.trashHoldStartMs = null;
+      return {
+        suppressCanvasDrawing: false,
+        isHoveringButton: false,
+        isHoldingTrash: false,
+        trashClearProgress: 0,
+        shouldTriggerTrashClear: false,
+      };
+    }
+
+    const screenX = cursorNormalized.x * window.innerWidth;
+    const screenY = cursorNormalized.y * window.innerHeight;
+
+    // Reset pinch origin latches when user opens their fingers
+    if (!isPinching) {
+      this.wasPinchingPrevFrame = false;
+      this.pinchStartedInUI = false;
+      this.pinchStartedOnCanvas = false;
+      this.trashHoldStartMs = null;
+    }
+
+    // If the user began pinching out on the drawing canvas, allow continuous stroke
+    // even if their hand passes near the bottom dock.
+    if (this.pinchStartedOnCanvas && isPinching) {
+      this.setHoveredTarget(null);
+      return {
+        suppressCanvasDrawing: false,
+        isHoveringButton: false,
+        isHoldingTrash: false,
+        trashClearProgress: 0,
+        shouldTriggerTrashClear: false,
+      };
+    }
+
+    // Hit-test interactive dock targets & capsule bounding box
+    const hitTarget = this.findHitTarget(screenX, screenY);
+    const overCapsule = this.isPointInsideElement(
+      screenX,
+      screenY,
+      this.capsuleEl,
+      12
+    );
+    const isOverUI = hitTarget !== null || overCapsule;
+
+    this.setHoveredTarget(hitTarget);
+
+    // Rising edge of Pinch
+    if (isPinching && !this.wasPinchingPrevFrame) {
+      this.wasPinchingPrevFrame = true;
+      if (isOverUI) {
+        this.pinchStartedInUI = true;
+        this.pinchStartedOnCanvas = false;
+
+        if (hitTarget && hitTarget !== this.clearBtn) {
+          // Air-Click dock button (Color swatch, Brush preset, Undo, Redo, Camera, etc.)
+          if (!(hitTarget as HTMLButtonElement).disabled) {
+            hitTarget.click();
+            hitTarget.classList.add('air-clicked');
+            setTimeout(() => hitTarget.classList.remove('air-clicked'), 240);
+          }
+        } else if (hitTarget === this.clearBtn && nowMs >= this.trashCooldownUntilMs) {
+          this.trashHoldStartMs = nowMs;
+        }
+      } else {
+        this.pinchStartedOnCanvas = true;
+        this.pinchStartedInUI = false;
+      }
+    }
+
+    // Handle continuous 1.0s Air-Pinch Hold on Trash Button
+    let isHoldingTrash = false;
+    let trashClearProgress = 0;
+    let shouldTriggerTrashClear = false;
+
+    if (
+      isPinching &&
+      this.pinchStartedInUI &&
+      hitTarget === this.clearBtn &&
+      nowMs >= this.trashCooldownUntilMs
+    ) {
+      if (this.trashHoldStartMs === null) {
+        this.trashHoldStartMs = nowMs;
+      }
+      isHoldingTrash = true;
+      const elapsed = Math.max(0, nowMs - this.trashHoldStartMs);
+      trashClearProgress = Math.min(1.0, elapsed / TRASH_HOLD_DURATION_MS);
+
+      if (elapsed >= TRASH_HOLD_DURATION_MS) {
+        shouldTriggerTrashClear = true;
+        trashClearProgress = 1.0;
+        this.trashCooldownUntilMs = nowMs + TRASH_COOLDOWN_MS;
+        this.trashHoldStartMs = null;
+      }
+    } else {
+      this.trashHoldStartMs = null;
+    }
+
+    return {
+      suppressCanvasDrawing: isOverUI || this.pinchStartedInUI,
+      isHoveringButton: hitTarget !== null,
+      isHoldingTrash,
+      trashClearProgress,
+      shouldTriggerTrashClear,
+    };
+  }
+
+  private findHitTarget(x: number, y: number): HTMLElement | null {
+    let bestTarget: HTMLElement | null = null;
+    let bestDist = Infinity;
+
+    for (const el of this.interactiveTargets) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) {
+        continue;
+      }
+      if (
+        x >= rect.left - HIT_PADDING_PX &&
+        x <= rect.right + HIT_PADDING_PX &&
+        y >= rect.top - HIT_PADDING_PX &&
+        y <= rect.bottom + HIT_PADDING_PX
+      ) {
+        const cx = (rect.left + rect.right) * 0.5;
+        const cy = (rect.top + rect.bottom) * 0.5;
+        const d = Math.hypot(x - cx, y - cy);
+        if (d < bestDist) {
+          bestDist = d;
+          bestTarget = el;
+        }
+      }
+    }
+    return bestTarget;
+  }
+
+  private isPointInsideElement(
+    x: number,
+    y: number,
+    el: HTMLElement,
+    pad = 0
+  ): boolean {
+    const rect = el.getBoundingClientRect();
+    return (
+      rect.width > 0 &&
+      x >= rect.left - pad &&
+      x <= rect.right + pad &&
+      y >= rect.top - pad &&
+      y <= rect.bottom + pad
+    );
+  }
+
+  private setHoveredTarget(target: HTMLElement | null): void {
+    if (this.currentHoveredTarget === target) {
+      return;
+    }
+    if (this.currentHoveredTarget) {
+      this.currentHoveredTarget.classList.remove('air-hover');
+    }
+    this.currentHoveredTarget = target;
+    if (this.currentHoveredTarget) {
+      this.currentHoveredTarget.classList.add('air-hover');
+    }
   }
 
   private bindKeyboardShortcuts(): void {
@@ -429,11 +656,11 @@ export class ToolbarUI {
 
       switch (state.gestureMode) {
         case 'DRAWING':
-          this.hudStatusTextEl.textContent = '[ ☝️ DRAWING ]';
+          this.hudStatusTextEl.textContent = '[ 🤏 DRAWING ]';
           this.hudRadialSvgEl.style.display = 'none';
           break;
         case 'HOVERING':
-          this.hudStatusTextEl.textContent = '[ ✌️ HOVERING ]';
+          this.hudStatusTextEl.textContent = '[ ✋ HOVERING ]';
           this.hudRadialSvgEl.style.display = 'none';
           break;
         case 'ERASER':
@@ -441,7 +668,7 @@ export class ToolbarUI {
           this.hudRadialSvgEl.style.display = 'none';
           break;
         case 'CLEARING': {
-          this.hudStatusTextEl.textContent = `[ 🖐️ CLEARING (${clearPct}%) ]`;
+          this.hudStatusTextEl.textContent = `[ 🗑️ CLEARING (${clearPct}%) ]`;
           this.hudRadialSvgEl.style.display = 'block';
           const circumference = 56.55;
           const offset = circumference * (1 - state.clearProgress);

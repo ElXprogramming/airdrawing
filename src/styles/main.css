@@ -731,10 +731,48 @@ body {
   box-shadow: 0 0 12px rgba(0, 240, 255, 0.25);
 }
 
-.utility-btn.danger-hover:hover:not(:disabled) {
-  background: rgba(255, 59, 92, 0.18);
-  border-color: rgba(255, 59, 92, 0.55);
+.utility-btn.danger-hover:hover:not(:disabled),
+.utility-btn.danger-hover.air-hover:not(:disabled) {
+  background: rgba(255, 59, 92, 0.22);
+  border-color: rgba(255, 59, 92, 0.65);
   color: #ff6b84;
+  box-shadow: 0 0 16px rgba(255, 59, 92, 0.35);
+}
+
+/* Spatial Air-Hover & Air-Click Dock Feedback */
+.color-swatch-btn.air-hover {
+  transform: scale(1.22);
+  border-color: #ffffff;
+  box-shadow:
+    0 0 0 3px rgba(0, 240, 255, 0.35),
+    0 0 18px var(--swatch-glow, rgba(0, 240, 255, 0.85));
+}
+
+.brush-preset-btn.air-hover,
+.utility-btn.air-hover:not(:disabled),
+.bg-seg-btn.air-hover,
+.guide-toggle-btn.air-hover {
+  background: rgba(0, 240, 255, 0.2);
+  border-color: rgba(0, 240, 255, 0.7);
+  box-shadow: 0 0 16px rgba(0, 240, 255, 0.35);
+  transform: translateY(-2px) scale(1.08);
+  color: #ffffff;
+}
+
+.air-clicked {
+  animation: air-click-pulse 0.24s ease-out;
+}
+
+@keyframes air-click-pulse {
+  0% {
+    transform: scale(0.9);
+  }
+  50% {
+    transform: scale(1.25);
+  }
+  100% {
+    transform: scale(1);
+  }
 }
 
 /* Responsive Adjustments for Mobile & Compact Viewports */

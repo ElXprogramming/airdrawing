@@ -43,15 +43,19 @@ export interface FingerExtensionStates {
 export interface GestureEvaluationResult {
   mode: GestureMode;
   rawMode: GestureMode;
-  /** Mirrored normalized [0..1] coordinates for active cursor (Landmark 8 or fist/eraser center) */
+  /** Mirrored normalized [0..1] coordinates for active cursor (Pinch midpoint / Index tip 8) */
   cursorNormalized: Point2D | null;
   /** Mirrored normalized [0..1] coordinates for palm center (Landmark 9) */
   palmCenterNormalized: Point2D | null;
-  /** Progress of 1.5-second open palm clear gesture in [0..1] */
+  /** True when Thumb Tip (4) and Index Tip (8) are within pinch threshold epsilon */
+  isPinching: boolean;
+  /** Continuous [0..1] proximity of Thumb Tip (4) to Index Tip (8) for visual reticle feedback */
+  pinchProximity: number;
+  /** Progress of canvas clear hold gesture in [0..1] */
   clearProgress: number;
-  /** True on the exact transition frame when 1.5s open palm hold completes */
+  /** True on the exact transition frame when clear hold completes */
   shouldTriggerClear: boolean;
-  /** True while inside the 2.0s post-clear cooldown window */
+  /** True while inside the post-clear cooldown window */
   inClearCooldown: boolean;
   /** Finger extension debug/telemetry state */
   fingerStates: FingerExtensionStates | null;

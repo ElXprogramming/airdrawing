@@ -10,7 +10,7 @@ interface TrailParticle {
   color: string;
 }
 
-const HAND_CONNECTIONS: ReadonlyArray< readonly [number, number] > = [
+const HAND_CONNECTIONS: ReadonlyArray<readonly [number, number]> = [
   // Thumb
   [0, 1],
   [1, 2],
@@ -49,12 +49,14 @@ export interface HudRenderParams {
   brushSize: number;
   eraserDiameter: number;
   clearProgress: number;
+  pinchProximity?: number;
+  isHoveringUI?: boolean;
   nowMs: number;
 }
 
 /**
- * Dynamic 60+ FPS overlay canvas renderer for adaptive fingertip reticles,
- * glowing particle trails, radial palm-clear progress rings, and optional hand skeleton.
+ * Dynamic 60+ FPS overlay canvas renderer for adaptive pinch/hover/eraser reticles,
+ * glowing particle trails, radial trash-hold clear progress rings, and optional hand skeleton.
  */
 export class HudRenderer {
   private readonly canvas: HTMLCanvasElement;
@@ -120,6 +122,8 @@ export class HudRenderer {
       brushSize,
       eraserDiameter,
       clearProgress,
+      pinchProximity = 0,
+      isHoveringUI = false,
       nowMs,
     } = params;
 
@@ -130,22 +134,23 @@ export class HudRenderer {
 
     // 2. Render Optional 21-Landmark Hand Skeleton
     if (showSkeleton && landmarks && landmarks.length >= 21) {
-      this.renderHandSkeleton(landmarks, activeColor, mode);
+      this.renderHandSkeleton(landmarks, activeColor, mode, pinchProximity);
     }
 
     // 3. Update & Render Trailing Particles (from Drawing Mode)
-    if (mode === 'DRAWING' && cursorNormalized) {
+    if (mode === 'DRAWING' && cursorNormalized && !isHoveringUI) {
       const cx = cursorNormalized.x * this.width;
       const cy = cursorNormalized.y * this.height;
       this.spawnDrawingParticles(cx, cy, activeColor, brushSize, nowMs);
     }
     this.updateAndRenderParticles();
 
-    // 4. Render Adaptive Cursor Reticle at Fingertip / Palm Center
-    if (mode === 'CLEARING' && palmCenterNormalized) {
-      const px = palmCenterNormalized.x * this.width;
-      const py = palmCenterNormalized.y * this.height;
-      this.renderPalmClearRing(px, py, clearProgress, nowMs);
+    // 4. Render Adaptive Cursor Reticle at Pinch / Fingertip Position
+    const clearAnchor = cursorNormalized ?? palmCenterNormalized;
+    if (mode === 'CLEARING' && clearAnchor) {
+      const px = clearAnchor.x * this.width;
+      const py = clearAnchor.y * this.height;
+      this.renderClearCountdownRing(px, py, clearProgress, nowMs);
     } else if (cursorNormalized) {
       const cx = cursorNormalized.x * this.width;
       const cy = cursorNormalized.y * this.height;
@@ -153,7 +158,15 @@ export class HudRenderer {
       if (mode === 'DRAWING') {
         this.renderDrawingReticle(cx, cy, activeColor, brushSize);
       } else if (mode === 'HOVERING') {
-        this.renderHoverReticle(cx, cy, activeColor, brushSize, nowMs);
+        this.renderHoverReticle(
+          cx,
+          cy,
+          activeColor,
+          brushSize,
+          nowMs,
+          pinchProximity,
+          isHoveringUI
+        );
       } else if (mode === 'ERASER') {
         this.renderEraserReticle(cx, cy, eraserDiameter, nowMs);
       }
@@ -206,33 +219,37 @@ export class HudRenderer {
 
   /**
    * Hover Mode Reticle: Dual-concentric dashed crosshair circle (aiming reticle)
-   * indicating pen-up motion.
+   * that dynamically contracts as Thumb (4) and Index (8) approach a pinch.
    */
   private renderHoverReticle(
     x: number,
     y: number,
     activeColor: string,
     brushSize: number,
-    nowMs: number
+    nowMs: number,
+    pinchProximity: number,
+    isHoveringUI: boolean
   ): void {
     const ctx = this.ctx;
     const rotation = (nowMs * 0.0018) % (Math.PI * 2);
-    const outerRadius = 22;
-    const innerRadius = 12;
+    // Rings contract smoothly as thumb & index approach pinch threshold
+    const outerRadius = 24 - pinchProximity * 7;
+    const innerRadius = Math.max(5, 13 - pinchProximity * 6);
+    const primaryRingColor = isHoveringUI ? '#00F0FF' : '#F59E0B';
 
     ctx.save();
     ctx.translate(x, y);
 
-    // Outer rotating dashed circle (Amber/Cyan cyber aim ring)
+    // Outer rotating dashed circle
     ctx.save();
     ctx.rotate(rotation);
     ctx.beginPath();
     ctx.arc(0, 0, outerRadius, 0, Math.PI * 2);
-    ctx.setLineDash([6, 5]);
-    ctx.strokeStyle = '#F59E0B';
-    ctx.lineWidth = 1.75;
-    ctx.shadowColor = 'rgba(245, 158, 11, 0.8)';
-    ctx.shadowBlur = 10;
+    ctx.setLineDash(isHoveringUI ? [8, 3] : [6, 5]);
+    ctx.strokeStyle = primaryRingColor;
+    ctx.lineWidth = isHoveringUI ? 2.2 : 1.75;
+    ctx.shadowColor = primaryRingColor;
+    ctx.shadowBlur = isHoveringUI ? 14 : 10;
     ctx.stroke();
     ctx.restore();
 
@@ -259,13 +276,19 @@ export class HudRenderer {
     ctx.lineTo(-tickOuter, 0);
     ctx.moveTo(tickInner, 0);
     ctx.lineTo(tickOuter, 0);
-    ctx.strokeStyle = 'rgba(245, 158, 11, 0.9)';
+    ctx.strokeStyle = primaryRingColor;
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
     // Center preview dot showing loaded ink color & brush scale
     ctx.beginPath();
-    ctx.arc(0, 0, Math.max(2.5, Math.min(7, brushSize * 0.35)), 0, Math.PI * 2);
+    ctx.arc(
+      0,
+      0,
+      Math.max(2.5, Math.min(7, brushSize * 0.35)),
+      0,
+      Math.PI * 2
+    );
     ctx.fillStyle = activeColor;
     ctx.shadowColor = activeColor;
     ctx.shadowBlur = 8;
@@ -329,10 +352,10 @@ export class HudRenderer {
   }
 
   /**
-   * Palm Clear Mode: Circular radial progress ring anchored at the palm center (Landmark 9)
-   * that sweeps clockwise from 0° to 360° over 1.5 seconds.
+   * Clear Countdown Ring: Circular radial progress ring that sweeps clockwise
+   * from 0° to 360° while holding pinch over the Trash button.
    */
-  private renderPalmClearRing(
+  private renderClearCountdownRing(
     x: number,
     y: number,
     progress: number,
@@ -340,18 +363,21 @@ export class HudRenderer {
   ): void {
     const ctx = this.ctx;
     const clamped = Math.max(0, Math.min(1, progress));
-    const radius = 44;
+    const radius = 40;
     const startAngle = -Math.PI / 2;
     const endAngle = startAngle + clamped * Math.PI * 2;
     const pct = Math.round(clamped * 100);
 
+    // Offset slightly above the bottom dock when cursor is near screen bottom
+    const renderY = Math.min(this.height - 96, y - 36);
+
     ctx.save();
-    ctx.translate(x, y);
+    ctx.translate(x, renderY);
 
     // Dark glassmorphic backing disc
     ctx.beginPath();
     ctx.arc(0, 0, radius + 8, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.72)';
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.82)';
     ctx.fill();
 
     // Track ring (muted slate)
@@ -382,16 +408,16 @@ export class HudRenderer {
     ctx.shadowBlur = 0;
     ctx.stroke();
 
-    // Percentage readout inside palm ring
+    // Percentage readout inside ring
     ctx.fillStyle = '#FFFFFF';
-    ctx.font = '700 15px Inter, system-ui, -apple-system, sans-serif';
+    ctx.font = '700 14px Inter, system-ui, -apple-system, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(`${pct}%`, 0, -5);
 
-    ctx.fillStyle = 'rgba(216, 180, 254, 0.9)';
+    ctx.fillStyle = 'rgba(216, 180, 254, 0.95)';
     ctx.font = '600 9px Inter, system-ui, -apple-system, sans-serif';
-    ctx.fillText('CLEARING', 0, 11);
+    ctx.fillText('CLEARING', 0, 10);
 
     ctx.restore();
   }
@@ -459,7 +485,8 @@ export class HudRenderer {
   private renderHandSkeleton(
     landmarks: NormalizedLandmark[],
     activeColor: string,
-    mode: GestureMode
+    mode: GestureMode,
+    pinchProximity: number
   ): void {
     const ctx = this.ctx;
     ctx.save();
@@ -480,18 +507,36 @@ export class HudRenderer {
     }
     ctx.stroke();
 
+    // Draw dynamic pinch tether between Thumb Tip (4) and Index Tip (8)
+    if (pinchProximity > 0.2) {
+      const t4x = (1.0 - landmarks[4].x) * this.width;
+      const t4y = landmarks[4].y * this.height;
+      const i8x = (1.0 - landmarks[8].x) * this.width;
+      const i8y = landmarks[8].y * this.height;
+      ctx.beginPath();
+      ctx.moveTo(t4x, t4y);
+      ctx.lineTo(i8x, i8y);
+      ctx.strokeStyle = activeColor;
+      ctx.globalAlpha = Math.min(1, pinchProximity * 0.9);
+      ctx.lineWidth = 2;
+      ctx.setLineDash(mode === 'DRAWING' ? [] : [3, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+    }
+
     // Draw 21 landmark joints
     for (let i = 0; i < landmarks.length; i++) {
       const lm = landmarks[i];
       const x = (1.0 - lm.x) * this.width;
       const y = lm.y * this.height;
 
-      const isIndexTip = i === 8;
+      const isPinchTip = i === 8 || i === 4;
       const isPalmCenter = i === 9;
 
       ctx.beginPath();
-      ctx.arc(x, y, isIndexTip ? 4.5 : isPalmCenter ? 4 : 2.5, 0, Math.PI * 2);
-      if (isIndexTip) {
+      ctx.arc(x, y, isPinchTip ? 4.5 : isPalmCenter ? 3.5 : 2.5, 0, Math.PI * 2);
+      if (isPinchTip) {
         ctx.fillStyle = mode === 'ERASER' ? '#FF3B5C' : activeColor;
       } else if (isPalmCenter) {
         ctx.fillStyle = '#C084FC';

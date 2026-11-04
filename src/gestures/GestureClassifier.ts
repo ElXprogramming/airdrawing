@@ -7,38 +7,34 @@ import type {
 } from '../types';
 
 export interface GestureClassifierConfig {
-  /** Hold duration in milliseconds required for Open Palm clear (default: 1500ms) */
-  clearHoldDurationMs?: number;
-  /** Cooldown duration in milliseconds after a canvas clear (default: 2000ms) */
-  clearCooldownDurationMs?: number;
-  /** Grace window in ms to tolerate single-frame tracking dropout during palm hold (default: 120ms) */
-  clearDropoutGraceMs?: number;
+  /** Normalized distance threshold (dist(4,8) / palmScale) to enter Pinch Draw mode (default: 0.34) */
+  pinchEnterThreshold?: number;
+  /** Normalized distance threshold (dist(4,8) / palmScale) to exit Pinch Draw mode (default: 0.43) */
+  pinchExitThreshold?: number;
   /** Consecutive frames required to confirm entering DRAWING or ERASER mode (default: 2) */
   confirmFramesRequired?: number;
 }
 
 /**
  * Scale- and tilt-invariant geometric heuristic classifier for the
- * "Point & Palm" gesture state machine.
+ * "Pinch to Draw" gesture state machine:
+ * - Pinch (Thumb 4 + Index 8 < epsilon): DRAWING (Pen Down) or Spatial UI Air-Click
+ * - Open / Relaxed Hand: HOVERING (Pen Up)
+ * - Closed Fist (All fingers curled): ERASER
  */
 export class GestureClassifier {
-  private readonly clearHoldDurationMs: number;
-  private readonly clearCooldownDurationMs: number;
-  private readonly clearDropoutGraceMs: number;
+  private readonly pinchEnterThreshold: number;
+  private readonly pinchExitThreshold: number;
   private readonly confirmFramesRequired: number;
 
   private activeMode: GestureMode = 'LOOKING';
   private pendingMode: GestureMode = 'LOOKING';
   private pendingCount = 0;
-
-  private clearHoldStartMs: number | null = null;
-  private lastClearFrameMs: number | null = null;
-  private cooldownUntilMs = 0;
+  private isPinchLatched = false;
 
   constructor(config: GestureClassifierConfig = {}) {
-    this.clearHoldDurationMs = config.clearHoldDurationMs ?? 1500;
-    this.clearCooldownDurationMs = config.clearCooldownDurationMs ?? 2000;
-    this.clearDropoutGraceMs = config.clearDropoutGraceMs ?? 120;
+    this.pinchEnterThreshold = config.pinchEnterThreshold ?? 0.34;
+    this.pinchExitThreshold = config.pinchExitThreshold ?? 0.43;
     this.confirmFramesRequired = config.confirmFramesRequired ?? 2;
   }
 
@@ -46,7 +42,7 @@ export class GestureClassifier {
    * 3D-aware Euclidean distance in normalized landmark space.
    * Uses 0.25 weight on Z to remain resilient to monocular depth estimation noise.
    */
-  private static dist(a: NormalizedLandmark, b: NormalizedLandmark): number {
+  public static dist(a: NormalizedLandmark, b: NormalizedLandmark): number {
     const dx = a.x - b.x;
     const dy = a.y - b.y;
     const dz = (a.z - b.z) * 0.25;
@@ -101,17 +97,14 @@ export class GestureClassifier {
     const distWristPip = GestureClassifier.dist(wrist, pip);
     const distMcpTip = GestureClassifier.dist(mcp, tip);
 
-    // Joint straightness at PIP and DIP
     const cosPip = GestureClassifier.bendCosine(mcp, pip, dip);
     const cosDip = GestureClassifier.bendCosine(pip, dip, tip);
 
-    // Radial extension ratio relative to PIP
     const radialExtended =
       distWristTip > distWristPip * 1.1 &&
       distWristTip > distWristDip * 1.01 &&
       distMcpTip > palmScale * 0.55;
 
-    // Straightness check ensures curled fingers tilted toward camera are rejected
     const jointsStraight = cosPip > 0.45 && cosDip > 0.35;
 
     return radialExtended && jointsStraight;
@@ -181,9 +174,6 @@ export class GestureClassifier {
     );
   }
 
-  /**
-   * Computes finger extension states for all 5 digits.
-   */
   public static getFingerStates(
     landmarks: NormalizedLandmark[]
   ): FingerExtensionStates {
@@ -230,17 +220,70 @@ export class GestureClassifier {
   }
 
   /**
-   * Classifies raw single-frame gesture from 21 hand landmarks.
+   * Evaluates the current hand landmarks to produce the stabilized
+   * "Pinch to Draw" gesture state, mirrored cursor coordinates, and pinch proximity.
    */
-  private classifyRawGesture(
-    landmarks: NormalizedLandmark[],
-    fingerStates: FingerExtensionStates
-  ): GestureMode {
+  public evaluate(
+    landmarks: NormalizedLandmark[] | null | undefined,
+    _nowMs: number
+  ): GestureEvaluationResult {
+    if (!landmarks || landmarks.length < 21) {
+      this.activeMode = 'LOOKING';
+      this.pendingMode = 'LOOKING';
+      this.pendingCount = 0;
+      this.isPinchLatched = false;
+
+      return {
+        mode: 'LOOKING',
+        rawMode: 'LOOKING',
+        cursorNormalized: null,
+        palmCenterNormalized: null,
+        isPinching: false,
+        pinchProximity: 0,
+        clearProgress: 0,
+        shouldTriggerClear: false,
+        inClearCooldown: false,
+        fingerStates: null,
+      };
+    }
+
     const palmScale = Math.max(
       0.02,
       GestureClassifier.dist(landmarks[0], landmarks[9])
     );
+    const fingerStates = GestureClassifier.getFingerStates(landmarks);
 
+    // Compute normalized pinch distance between Thumb Tip (4) and Index Tip (8)
+    const pinchDist = GestureClassifier.dist(landmarks[4], landmarks[8]);
+    const pinchRatio = pinchDist / palmScale;
+
+    // Hysteresis latch for Pinch (prevents mid-stroke dropout)
+    if (this.isPinchLatched) {
+      if (pinchRatio > this.pinchExitThreshold) {
+        this.isPinchLatched = false;
+      }
+    } else {
+      if (pinchRatio < this.pinchEnterThreshold) {
+        this.isPinchLatched = true;
+      }
+    }
+
+    // Continuous proximity [0..1] for dynamic aiming reticle feedback
+    const maxHoverRatio = 0.85;
+    const rawProximity =
+      (maxHoverRatio - pinchRatio) /
+      Math.max(0.05, maxHoverRatio - this.pinchEnterThreshold);
+    const pinchProximity = Math.max(0, Math.min(1, rawProximity));
+
+    // Check if all 4 main fingers are curled into a Closed Fist
+    const indexCurled = GestureClassifier.isFingerCurled(
+      landmarks,
+      5,
+      6,
+      7,
+      8,
+      palmScale
+    );
     const middleCurled = GestureClassifier.isFingerCurled(
       landmarks,
       9,
@@ -265,56 +308,8 @@ export class GestureClassifier {
       20,
       palmScale
     );
-    const indexCurled = GestureClassifier.isFingerCurled(
-      landmarks,
-      5,
-      6,
-      7,
-      8,
-      palmScale
-    );
 
-    // 1. Open Palm (Clear Canvas): All 5 fingers extended and spread
-    if (
-      fingerStates.thumb &&
-      fingerStates.index &&
-      fingerStates.middle &&
-      fingerStates.ring &&
-      fingerStates.pinky
-    ) {
-      const spreadSpan = GestureClassifier.dist(landmarks[8], landmarks[20]);
-      if (spreadSpan > palmScale * 0.55) {
-        return 'CLEARING';
-      }
-    }
-
-    // 2. Peace / V Sign (Hover Mode): Index + Middle extended, Ring + Pinky curled
-    if (
-      fingerStates.index &&
-      fingerStates.middle &&
-      !fingerStates.ring &&
-      !fingerStates.pinky &&
-      ringCurled &&
-      pinkyCurled
-    ) {
-      return 'HOVERING';
-    }
-
-    // 3. Index Point (Draw Mode): Index extended, Middle + Ring + Pinky curled
-    if (
-      fingerStates.index &&
-      !fingerStates.middle &&
-      !fingerStates.ring &&
-      !fingerStates.pinky &&
-      middleCurled &&
-      ringCurled &&
-      pinkyCurled
-    ) {
-      return 'DRAWING';
-    }
-
-    // 4. Closed Fist (Eraser Mode): All 4 fingers curled and thumb not openly extended
-    if (
+    const allFourCurled =
       !fingerStates.index &&
       !fingerStates.middle &&
       !fingerStates.ring &&
@@ -322,84 +317,60 @@ export class GestureClassifier {
       indexCurled &&
       middleCurled &&
       ringCurled &&
-      pinkyCurled &&
-      !fingerStates.thumb
-    ) {
-      return 'ERASER';
+      pinkyCurled;
+
+    // Distinguish Precision Pinch from Closed Fist:
+    // In a Precision Pinch, Thumb Tip (4) and Index Tip (8) meet (< pinchThreshold),
+    // and either at least one other finger is relaxed/extended OR the index tip is
+    // held forward of the knuckle base rather than tucked into the wrist.
+    const distWristIndexTip = GestureClassifier.dist(landmarks[0], landmarks[8]);
+    const distWristIndexMcp = GestureClassifier.dist(landmarks[0], landmarks[5]);
+    const indexFoldedDeepIntoPalm = distWristIndexTip < distWristIndexMcp * 0.96;
+
+    let rawMode: GestureMode = 'HOVERING';
+
+    if (this.isPinchLatched && !(allFourCurled && indexFoldedDeepIntoPalm)) {
+      rawMode = 'DRAWING';
+    } else if (allFourCurled && !fingerStates.thumb && !this.isPinchLatched) {
+      rawMode = 'ERASER';
+    } else {
+      rawMode = 'HOVERING';
     }
 
-    // Fallback transitional posture defaults to non-destructive HOVERING
-    return 'HOVERING';
-  }
+    // Mirror X coordinate and smoothly blend cursor between Index Tip (8) when hovering
+    // and the exact Pinch Midpoint ((4 + 8) / 2) when pinching.
+    const blendToMidpoint = pinchProximity * 0.5;
+    const rawCursorX =
+      landmarks[8].x * (1 - blendToMidpoint) +
+      landmarks[4].x * blendToMidpoint;
+    const rawCursorY =
+      landmarks[8].y * (1 - blendToMidpoint) +
+      landmarks[4].y * blendToMidpoint;
 
-  /**
-   * Evaluates the current hand landmarks and timestamp to produce the stabilized
-   * gesture state, mirrored cursor coordinates, and 1.5s radial palm-clear progress.
-   */
-  public evaluate(
-    landmarks: NormalizedLandmark[] | null | undefined,
-    nowMs: number
-  ): GestureEvaluationResult {
-    const inClearCooldown = nowMs < this.cooldownUntilMs;
-
-    if (!landmarks || landmarks.length < 21) {
-      this.activeMode = 'LOOKING';
-      this.pendingMode = 'LOOKING';
-      this.pendingCount = 0;
-
-      if (
-        this.clearHoldStartMs !== null &&
-        this.lastClearFrameMs !== null &&
-        nowMs - this.lastClearFrameMs > this.clearDropoutGraceMs
-      ) {
-        this.clearHoldStartMs = null;
-        this.lastClearFrameMs = null;
-      }
-
-      return {
-        mode: 'LOOKING',
-        rawMode: 'LOOKING',
-        cursorNormalized: null,
-        palmCenterNormalized: null,
-        clearProgress: 0,
-        shouldTriggerClear: false,
-        inClearCooldown,
-        fingerStates: null,
-      };
-    }
-
-    const fingerStates = GestureClassifier.getFingerStates(landmarks);
-    const rawMode = this.classifyRawGesture(landmarks, fingerStates);
-
-    // Mirror X coordinate: x = 1 - landmark.x
-    const indexTip: Point2D = {
-      x: 1.0 - landmarks[8].x,
-      y: landmarks[8].y,
+    const cursorPoint: Point2D = {
+      x: 1.0 - rawCursorX,
+      y: rawCursorY,
     };
+
     const palmCenter: Point2D = {
       x: 1.0 - landmarks[9].x,
       y: landmarks[9].y,
     };
 
     // Stabilize transitions:
-    // - Exiting DRAWING to any other posture happens immediately on frame 1
-    //   so lifting or curling a finger never drags an unwanted tail stroke.
+    // - Exiting DRAWING to HOVERING happens immediately on frame 1 (unpinching lifts pen immediately)
     // - Entering DRAWING or ERASER requires confirmFramesRequired consecutive frames
-    //   to eliminate accidental false triggers while navigating across the screen.
     if (rawMode === this.activeMode) {
       this.pendingMode = rawMode;
       this.pendingCount = 0;
     } else {
-      const immediateTransition =
-        rawMode === 'HOVERING' || rawMode === 'CLEARING';
+      const immediateTransition = rawMode === 'HOVERING';
 
       if (immediateTransition || this.confirmFramesRequired <= 1) {
         this.activeMode = rawMode;
         this.pendingMode = rawMode;
         this.pendingCount = 0;
       } else {
-        // If currently DRAWING and user curls into ERASER, lift pen immediately to HOVERING
-        // while confirming ERASER over confirmFramesRequired frames.
         if (this.activeMode === 'DRAWING') {
           this.activeMode = 'HOVERING';
         }
@@ -418,59 +389,16 @@ export class GestureClassifier {
       }
     }
 
-    // Handle 1.5-second Open Palm Clear timer & 2-second cooldown
-    let clearProgress = 0;
-    let shouldTriggerClear = false;
-
-    if (this.activeMode === 'CLEARING') {
-      if (inClearCooldown) {
-        // During 2-second cooldown after a wipe, show hover behavior without re-clearing
-        this.clearHoldStartMs = null;
-        this.lastClearFrameMs = null;
-      } else {
-        if (this.clearHoldStartMs === null) {
-          this.clearHoldStartMs = nowMs;
-        }
-        this.lastClearFrameMs = nowMs;
-        const elapsed = Math.max(0, nowMs - this.clearHoldStartMs);
-        clearProgress = Math.min(1.0, elapsed / this.clearHoldDurationMs);
-
-        if (elapsed >= this.clearHoldDurationMs) {
-          shouldTriggerClear = true;
-          clearProgress = 1.0;
-          this.cooldownUntilMs = nowMs + this.clearCooldownDurationMs;
-          this.clearHoldStartMs = null;
-          this.lastClearFrameMs = null;
-        }
-      }
-    } else {
-      if (
-        this.clearHoldStartMs !== null &&
-        this.lastClearFrameMs !== null &&
-        nowMs - this.lastClearFrameMs <= this.clearDropoutGraceMs
-      ) {
-        // Keep hold timer alive across brief 1-frame jitter
-        const elapsed = Math.max(0, nowMs - this.clearHoldStartMs);
-        clearProgress = Math.min(0.99, elapsed / this.clearHoldDurationMs);
-      } else {
-        this.clearHoldStartMs = null;
-        this.lastClearFrameMs = null;
-      }
-    }
-
-    const effectiveMode: GestureMode =
-      this.activeMode === 'CLEARING' && inClearCooldown && !shouldTriggerClear
-        ? 'HOVERING'
-        : this.activeMode;
-
     return {
-      mode: effectiveMode,
+      mode: this.activeMode,
       rawMode,
-      cursorNormalized: indexTip,
+      cursorNormalized: cursorPoint,
       palmCenterNormalized: palmCenter,
-      clearProgress,
-      shouldTriggerClear,
-      inClearCooldown: nowMs < this.cooldownUntilMs,
+      isPinching: this.activeMode === 'DRAWING',
+      pinchProximity,
+      clearProgress: 0,
+      shouldTriggerClear: false,
+      inClearCooldown: false,
       fingerStates,
     };
   }
@@ -479,8 +407,6 @@ export class GestureClassifier {
     this.activeMode = 'LOOKING';
     this.pendingMode = 'LOOKING';
     this.pendingCount = 0;
-    this.clearHoldStartMs = null;
-    this.lastClearFrameMs = null;
-    this.cooldownUntilMs = 0;
+    this.isPinchLatched = false;
   }
 }
